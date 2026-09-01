@@ -17,11 +17,19 @@
 
 ## 基础用法
 
-所有命令都使用：
+常用子命令使用：
 
 ```bash
 node order.js <command> ...
 ```
+
+此外，仍保留一个直接登录入口：
+
+```bash
+node order.js <username> <password> [smsCode]
+```
+
+该入口只执行登录，不会缓存登录态；日常使用建议优先使用下方的 `sms-login`、`book-sms` 或 `race-grab-sms`。
 
 站名可以直接写中文，比如 `上海虹桥`、`银川`，脚本会通过 `12306-enums.js` 转成电报码。
 
@@ -159,15 +167,16 @@ node order.js race-grab-sms 13209628749 '密码' 0519 上海 银川 2026-06-03 K
 
 - 每轮查询会展开所有可直接购买的“车次+席别”组合
 - 对所有可买组合同时发起下单流水线
-- 所有进入队列的组合都会轮询队列结果
+- 异步进入直购队列的组合会轮询队列结果
 - 任意一个组合拿到订单并确认成功，整体立即返回成功
-- 未进入队列或失败的组合不会阻塞下一轮抢票
+- 当本轮全部候选组合确认失败后，才会开始下一轮查询；若某个组合正在直购排队，本轮会等待其返回最终结果或超时
 - 如果本轮没有任何直购组合，但识别到可候补组合，会把所有可候补“车次+席别”一次性提交候补订单
 
 注意：
 
 - 这个模式会尝试为每个候选组合创建独立服务端会话，避免同一个 `JSESSIONID` 下 `submitOrderRequest/initDc` 上下文互相覆盖。
-- 候补订单会进入候补排队和待支付流程；如果 12306 返回人证核验或滑块校验，脚本会停止并输出对应阶段，避免重复提交。
+- 脚本会提交候补订单并轮询候补排队结果；候补订单创建成功后，仍需按 12306 的页面或 App 提示自行完成支付。脚本不会自动支付。
+- 如果 12306 返回人证核验或滑块校验，脚本会停止并输出对应阶段，避免重复提交。
 
 ## 自动刷票间隔
 
@@ -200,9 +209,9 @@ node order.js race-grab-sms 13209628749 '密码' 0519 上海 银川 2026-06-03 K
 
 ## 排队阶段确认
 
-12306 的最终提交接口返回 `submitStatus: true` 时，只代表请求已经进入队列，不一定代表订单最终成功。
+12306 的最终提交接口返回 `submitStatus: true` 时，不一定代表订单最终成功。若返回的是异步排队结果（`isAsync === '1'`），脚本会继续确认排队状态。
 
-脚本现在会继续执行：
+异步排队时，后续流程为：
 
 ```text
 confirmSingleForQueue
@@ -221,11 +230,11 @@ resultOrderForDcQueue
 }
 ```
 
-队列轮询间隔是固定的 `1000ms`，对应 `order.js` 里的 `QUEUE_POLL_INTERVAL_MS`。如果要调慢或调快，只改这个常量即可。
+队列轮询间隔是固定的 `1000ms`，对应 `constant/index.js` 里的 `QUEUE_POLL_INTERVAL_MS`。如果要调慢或调快，只改这个常量即可。
 
 当 `queryOrderWaitTime` 返回 `waitTime = -1` 或 `waitTime = -100` 且包含 `orderId` 时，脚本会调用 `resultOrderForDcQueue` 获取最终结果。
 
-最终 `ok` 以排队确认结果为准：
+异步排队的最终 `ok` 以排队确认结果为准：
 
 - `resultOrderForDcQueue.data.submitStatus === true`：订单确认成功
 - 排队失败、登录态失效、超时、或最终结果失败：`ok` 为 `false`
@@ -236,6 +245,8 @@ resultOrderForDcQueue
 - 不可重试失败：乘车人不存在、席别不支持、人证核验、扫码、滑块等，会立即停止并输出对应原因。
 
 ## 常见输出阶段
+
+部分阶段是实时日志的顶层 `stage`，其余阶段会出现在候选组合的 `result`、`finalSubmit` 或 `standby` 嵌套结果中。
 
 | stage | 含义 |
 | --- | --- |
@@ -254,8 +265,8 @@ resultOrderForDcQueue
 | `standby_query_queue` | 正在轮询候补排队状态 |
 | `standby_order_retry` | 候补提交或候补队列失败，准备下一轮重试 |
 | `standby_order_failed` | 候补订单未创建成功，通常需要查看返回消息或人工核验 |
-| `submit_order_request` | 已提交订单请求，进入确认乘客流程 |
-| `ready_to_confirm_order` | 已完成预检查，但未最终下单 |
+| `race_candidate_done` | 某个“车次+席别”候选组合已结束；详细下单与排队结果在 `result` 内 |
+| `submit_order_request` | 候选组合的订单请求阶段（作为 `race_candidate_done.result` 的内部结果出现） |
 | `confirm_single_for_queue` | 已调用最终下单接口 |
 | `query_order_wait_time` | 正在查询排队状态 |
 | `result_order_for_dc_queue` | 已拿到订单号并确认排队最终结果 |
@@ -268,3 +279,4 @@ resultOrderForDcQueue
 - `.12306-session.json` 包含 cookie，注意保管。
 - 密码不会写入 `.12306-session.json`。
 - 多选车次和席别时，脚本会同时尝试所有可买组合。
+- 密码中含有空格、`$`、`!` 等 shell 特殊字符时，请用单引号包住密码参数。
